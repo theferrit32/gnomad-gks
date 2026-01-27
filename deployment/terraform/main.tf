@@ -36,6 +36,14 @@ resource "google_service_account" "cloudrun_gnomad" {
   display_name = "Cloud Run gnomAD VRS annotation jobs"
 }
 
+resource "google_artifact_registry_repository_iam_member" "cloudrun_gnomad_ar_writer" {
+  project    = "kferrite-sandbox-26c7"
+  location   = google_artifact_registry_repository.gnomad_gks.location
+  repository = google_artifact_registry_repository.gnomad_gks.repository_id
+  role       = "roles/artifactregistry.writer"
+  member     = "serviceAccount:${google_service_account.cloudrun_gnomad.email}"
+}
+
 resource "google_storage_bucket_iam_member" "cloudrun_gnomad_writer" {
   bucket = "kferrite-sandbox-storage"
   role   = "roles/storage.objectAdmin"
