@@ -1,0 +1,418 @@
+---
+- name: Deploy AnyVar and gnomad environments
+  hosts: all
+  become: false
+  vars:
+    anyvar_version: "1.0.0-rc3"
+    anyvar_port: 8000
+    anyvar_venv: "{{ ansible_facts['user_dir'] }}/.venv/anyvar"
+    gnomad_venv: "{{ ansible_facts['user_dir'] }}/.venv/gnomad"
+    seqrepo_dir: "{{ ansible_facts['user_dir'] }}/seqrepo"
+    uv_bin: "{{ ansible_facts['user_dir'] }}/.local/bin/uv"
+    uta_version: "uta_20241220"
+    uta_pgdump_url: "https://pub-a70997b5b39342fe887c521b504d73de.r2.dev/uta_20241220.pgd.gz"
+    systemd_user_env:
+      XDG_RUNTIME_DIR: "/run/user/{{ ansible_facts['user_uid'] }}"
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ ansible_facts['user_uid'] }}/bus"
+
+  tasks:
+    # =========================================================================
+    # Phase 1: Global Setup
+    # =========================================================================
+
+    - name: Install Podman and supporting packages
+      become: true
+      ansible.builtin.apt:
+        name:
+          - podman
+          - podman-compose
+          - uidmap
+          - slirp4netns
+          - fuse-overlayfs
+          - build-essential
+          - libpq-dev
+          - rsync
+          - qemu-user-static
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install uv
+      ansible.builtin.shell: curl -LsSf https://astral.sh/uv/install.sh | sh
+      args:
+        creates: "{{ uv_bin }}"
+
+    - name: Check for uv Python install directory
+      ansible.builtin.stat:
+        path: "{{ ansible_facts['user_dir'] }}/.local/share/uv/python"
+      register: uv_python_dir
+      changed_when: false
+
+    - name: Check whether Python 3.12 is already installed via uv
+      ansible.builtin.find:
+        paths: "{{ ansible_facts['user_dir'] }}/.local/share/uv/python"
+        patterns: "cpython-3.12*"
+        file_type: directory
+      register: uv_py312_find
+      changed_when: false
+      when: uv_python_dir.stat.exists
+
+    - name: Install Python 3.12 via uv
+      ansible.builtin.command: "{{ uv_bin }} python install 3.12"
+      when: (not uv_python_dir.stat.exists) or (uv_py312_find.matched | default(0) == 0)
+
+    - name: Add Adoptium repository (for Temurin JDK)
+      become: true
+      ansible.builtin.deb822_repository:
+        name: adoptium
+        types: deb
+        uris: https://packages.adoptium.net/artifactory/deb
+        suites: noble
+        components: main
+        signed_by: https://packages.adoptium.net/artifactory/api/gpg/key/public
+
+    - name: Install Temurin 17 JDK (required for Hail/Spark with GCS connector)
+      become: true
+      ansible.builtin.apt:
+        name: temurin-17-jdk
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Enable user lingering (allow user services at boot)
+      become: true
+      ansible.builtin.command: "loginctl enable-linger {{ ansible_facts['user_id'] }}"
+      changed_when: false
+
+    - name: Ensure user systemd manager is running
+      become: true
+      ansible.builtin.command: "systemctl start user@{{ ansible_facts['user_uid'] }}.service"
+      changed_when: false
+
+    - name: Ensure systemd user unit directory exists
+      ansible.builtin.file:
+        path: "{{ ansible_facts['user_dir'] }}/.config/systemd/user"
+        state: directory
+        mode: "0755"
+
+    # =========================================================================
+    # Phase 2: AnyVar Setup
+    # =========================================================================
+
+    # -- 2a. Python Environment --
+    - name: Create AnyVar virtualenv
+      ansible.builtin.command: "{{ uv_bin }} venv --python 3.12 {{ anyvar_venv }}"
+      args:
+        creates: "{{ anyvar_venv }}/bin/activate"
+
+    - name: Install AnyVar from GitHub tag
+      ansible.builtin.command: >
+        {{ uv_bin }} pip install
+        "biocommons.anyvar[postgres,queueing] @ git+https://github.com/biocommons/anyvar@{{ anyvar_version }}"
+      environment:
+        VIRTUAL_ENV: "{{ anyvar_venv }}"
+      args:
+        creates: "{{ anyvar_venv }}/bin/uvicorn"
+
+    # -- 2b. SeqRepo Setup --
+    - name: Ensure seqrepo directory exists
+      ansible.builtin.file:
+        path: "{{ seqrepo_dir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Check if seqrepo is already populated
+      ansible.builtin.stat:
+        path: "{{ seqrepo_dir }}/2024-12-20"
+      register: seqrepo_data
+
+    - name: Populate seqrepo via rsync (one-time, ~15GB download)
+      ansible.builtin.command: >
+        {{ anyvar_venv }}/bin/seqrepo --root-directory {{ seqrepo_dir }} pull -i 2024-12-20
+      when: not seqrepo_data.stat.exists
+      async: 3600
+      poll: 30
+
+    # -- 2c. Database Volumes --
+    - name: Check if UTA volume exists
+      ansible.builtin.command: podman volume inspect uta_vol
+      register: uta_vol_check
+      changed_when: false
+      failed_when: false
+
+    - name: Create UTA volume
+      ansible.builtin.command: podman volume create uta_vol
+      when: uta_vol_check.rc != 0
+
+    - name: Check if AnyVar DB volume exists
+      ansible.builtin.command: podman volume inspect anyvar_vol
+      register: anyvar_vol_check
+      changed_when: false
+      failed_when: false
+
+    - name: Create AnyVar DB volume
+      ansible.builtin.command: podman volume create anyvar_vol
+      when: anyvar_vol_check.rc != 0
+
+    # -- 2d. Systemd Services --
+    - name: Install anyvar-uta.service
+      ansible.builtin.copy:
+        dest: "{{ ansible_facts['user_dir'] }}/.config/systemd/user/anyvar-uta.service"
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=UTA Postgres container
+          After=network-online.target
+
+          [Service]
+          Type=simple
+          ExecStart=/usr/bin/podman run --rm --name uta \
+            -e POSTGRES_DB=uta \
+            -e POSTGRES_USER=uta_admin \
+            -e POSTGRES_PASSWORD=uta-password \
+            -v uta_vol:/var/lib/postgresql/data \
+            -p 127.0.0.1:5433:5432 \
+            docker.io/library/postgres:17
+          ExecStop=/usr/bin/podman stop uta
+          Restart=on-failure
+          TimeoutStartSec=300
+
+          [Install]
+          WantedBy=default.target
+      notify: Reload systemd user daemon
+
+    - name: Install anyvar-db.service
+      ansible.builtin.copy:
+        dest: "{{ ansible_facts['user_dir'] }}/.config/systemd/user/anyvar-db.service"
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=AnyVar Postgres container
+          After=network-online.target
+
+          [Service]
+          Type=simple
+          ExecStart=/usr/bin/podman run --rm --name anyvar-db \
+            -e POSTGRES_DB=anyvar \
+            -e POSTGRES_USER=anyvar \
+            -e POSTGRES_PASSWORD=anyvar-pw \
+            -v anyvar_vol:/var/lib/postgresql/data \
+            -p 127.0.0.1:5432:5432 \
+            docker.io/library/postgres:17
+          ExecStop=/usr/bin/podman stop anyvar-db
+          Restart=on-failure
+
+          [Install]
+          WantedBy=default.target
+      notify: Reload systemd user daemon
+
+    - name: Install anyvar-redis.service
+      ansible.builtin.copy:
+        dest: "{{ ansible_facts['user_dir'] }}/.config/systemd/user/anyvar-redis.service"
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Redis container for Celery broker/backend
+          After=network-online.target
+
+          [Service]
+          Type=simple
+          ExecStart=/usr/bin/podman run --rm --name anyvar-redis \
+            -p 127.0.0.1:6379:6379 \
+            docker.io/library/redis:7
+          ExecStop=/usr/bin/podman stop anyvar-redis
+          Restart=on-failure
+
+          [Install]
+          WantedBy=default.target
+      notify: Reload systemd user daemon
+
+    - name: Ensure async work directory exists
+      ansible.builtin.file:
+        path: "{{ ansible_facts['user_dir'] }}/tmp"
+        state: directory
+        mode: "0755"
+
+    - name: Ensure wags_tails data directory exists
+      ansible.builtin.file:
+        path: "{{ ansible_facts['user_dir'] }}/.local/share/wags_tails"
+        state: directory
+        mode: "0755"
+
+    - name: Install anyvar.service
+      ansible.builtin.copy:
+        dest: "{{ ansible_facts['user_dir'] }}/.config/systemd/user/anyvar.service"
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=AnyVar REST API
+          After=network-online.target anyvar-uta.service anyvar-db.service anyvar-redis.service
+          Requires=anyvar-uta.service anyvar-db.service anyvar-redis.service
+
+          [Service]
+          Type=simple
+          Environment=SEQREPO_DATAPROXY_URI=seqrepo+file://{{ seqrepo_dir }}/2024-12-20
+          Environment=UTA_DB_URL=postgresql://anonymous@127.0.0.1:5433/uta/{{ uta_version }}
+          Environment=ANYVAR_STORAGE_URI=postgresql://anyvar:anyvar-pw@127.0.0.1:5432/anyvar
+          Environment=CELERY_BROKER_URL=redis://127.0.0.1:6379
+          Environment=CELERY_BACKEND_URL=redis://127.0.0.1:6379
+          Environment=ANYVAR_VCF_ASYNC_WORK_DIR={{ ansible_facts['user_dir'] }}/tmp
+          Environment=WAGS_TAILS_DIR={{ ansible_facts['user_dir'] }}/.local/share/wags_tails
+          ExecStart={{ anyvar_venv }}/bin/python -m uvicorn anyvar.restapi.main:app --host 0.0.0.0 --port {{ anyvar_port }} --workers 4
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=default.target
+      notify: Reload systemd user daemon
+
+    - name: Install anyvar-celery.service
+      ansible.builtin.copy:
+        dest: "{{ ansible_facts['user_dir'] }}/.config/systemd/user/anyvar-celery.service"
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=AnyVar Celery worker for async VCF processing
+          After=network-online.target anyvar-uta.service anyvar-db.service anyvar-redis.service
+          Requires=anyvar-uta.service anyvar-db.service anyvar-redis.service
+
+          [Service]
+          Type=simple
+          Environment=SEQREPO_DATAPROXY_URI=seqrepo+file://{{ seqrepo_dir }}/2024-12-20
+          Environment=UTA_DB_URL=postgresql://anonymous@127.0.0.1:5433/uta/{{ uta_version }}
+          Environment=ANYVAR_STORAGE_URI=postgresql://anyvar:anyvar-pw@127.0.0.1:5432/anyvar
+          Environment=CELERY_BROKER_URL=redis://127.0.0.1:6379
+          Environment=CELERY_BACKEND_URL=redis://127.0.0.1:6379
+          Environment=ANYVAR_VCF_ASYNC_WORK_DIR={{ ansible_facts['user_dir'] }}/tmp
+          Environment=WAGS_TAILS_DIR={{ ansible_facts['user_dir'] }}/.local/share/wags_tails
+          ExecStart={{ anyvar_venv }}/bin/celery -A anyvar.queueing.celery_worker:celery_app worker --loglevel=info
+          Restart=on-failure
+          RestartSec=5
+
+          [Install]
+          WantedBy=default.target
+      notify: Reload systemd user daemon
+
+    - name: Flush handlers to reload systemd
+      ansible.builtin.meta: flush_handlers
+
+    - name: Enable and start anyvar-uta.service
+      ansible.builtin.systemd:
+        name: anyvar-uta.service
+        scope: user
+        enabled: true
+        state: started
+      environment: "{{ systemd_user_env }}"
+
+    - name: Wait for UTA postgres to be ready
+      ansible.builtin.command: podman exec uta pg_isready -U uta_admin -d uta
+      register: uta_pg_ready
+      until: uta_pg_ready.rc == 0
+      retries: 30
+      delay: 2
+      changed_when: false
+
+    - name: Check if UTA schema exists
+      ansible.builtin.command: >
+        podman exec uta psql -U uta_admin -d uta -tAc
+        "SELECT 1 FROM information_schema.schemata WHERE schema_name = '{{ uta_version }}'"
+      register: uta_schema_check
+      changed_when: false
+      failed_when: false
+
+    - name: Download UTA pg dump
+      ansible.builtin.get_url:
+        url: "{{ uta_pgdump_url }}"
+        dest: /tmp/uta_dump.pgd.gz
+        mode: "0644"
+      when: uta_schema_check.stdout != "1"
+
+    - name: Create anonymous user for UTA
+      ansible.builtin.command: >
+        podman exec uta psql -U uta_admin -d uta -c
+        "DO $$ BEGIN CREATE ROLE anonymous WITH LOGIN; EXCEPTION WHEN duplicate_object THEN NULL; END $$;"
+      when: uta_schema_check.stdout != "1"
+      changed_when: false
+
+    - name: Load UTA pg dump
+      ansible.builtin.shell: >
+        gzip -cd /tmp/uta_dump.pgd.gz | podman exec -i uta psql -1e -U uta_admin -d uta -v ON_ERROR_STOP=1
+      when: uta_schema_check.stdout != "1"
+      async: 3600
+      poll: 30
+
+    - name: Enable and start anyvar-db.service
+      ansible.builtin.systemd:
+        name: anyvar-db.service
+        scope: user
+        enabled: true
+        state: started
+      environment: "{{ systemd_user_env }}"
+
+    - name: Enable and start anyvar-redis.service
+      ansible.builtin.systemd:
+        name: anyvar-redis.service
+        scope: user
+        enabled: true
+        state: started
+      environment: "{{ systemd_user_env }}"
+
+    - name: Enable and start anyvar.service
+      ansible.builtin.systemd:
+        name: anyvar.service
+        scope: user
+        enabled: true
+        state: started
+      environment: "{{ systemd_user_env }}"
+
+    - name: Enable and start anyvar-celery.service
+      ansible.builtin.systemd:
+        name: anyvar-celery.service
+        scope: user
+        enabled: true
+        state: started
+      environment: "{{ systemd_user_env }}"
+
+    - name: Wait for AnyVar to be healthy
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ anyvar_port }}/service-info"
+        status_code: 200
+      register: health_check
+      until: health_check.status == 200
+      retries: 6
+      delay: 5
+
+    # =========================================================================
+    # Phase 3: gnomad Setup
+    # =========================================================================
+
+    - name: Create gnomad virtualenv
+      ansible.builtin.command: "{{ uv_bin }} venv --python 3.12 {{ gnomad_venv }}"
+      args:
+        creates: "{{ gnomad_venv }}/bin/activate"
+
+    - name: Install hail
+      ansible.builtin.command: "{{ uv_bin }} pip install hail~=0.2.137"
+      environment:
+        VIRTUAL_ENV: "{{ gnomad_venv }}"
+      args:
+        creates: "{{ gnomad_venv }}/lib/python3.12/site-packages/hail"
+
+    - name: Install hail GCS connector
+      ansible.builtin.shell: curl -sSL https://broad.io/install-gcs-connector | {{ gnomad_venv }}/bin/python3
+      args:
+        creates: "{{ gnomad_venv }}/lib/python3.12/site-packages/pyspark/conf/spark-defaults.conf"
+
+    - name: Install gnomad package
+      ansible.builtin.command: "{{ uv_bin }} pip install gnomad"
+      environment:
+        VIRTUAL_ENV: "{{ gnomad_venv }}"
+      args:
+        creates: "{{ gnomad_venv }}/lib/python3.12/site-packages/gnomad"
+
+  handlers:
+    - name: Reload systemd user daemon
+      ansible.builtin.systemd:
+        daemon_reload: true
+        scope: user
+      environment: "{{ systemd_user_env }}"

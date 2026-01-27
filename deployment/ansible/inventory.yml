@@ -1,0 +1,4 @@
+all:
+  hosts:
+    # gnomad-gks:
+    gnomad-gks.us-central1-a.kferrite-sandbox-26c7:
