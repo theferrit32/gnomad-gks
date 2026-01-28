@@ -104,15 +104,15 @@ for contig in "${CONTIGS[@]}"; do
         echo "[DRY RUN] gcloud run jobs create|update \"$JOB_NAME\" --image \"$IMAGE\" --service-account \"$SERVICE_ACCOUNT\" --memory \"$MEMORY\" --cpu \"$CPU\" --task-timeout \"$TIMEOUT\" --max-retries \"$MAX_RETRIES\" --labels \"$LABELS\" --set-env-vars \"$ENV_VARS\" --project \"$PROJECT\" --region \"$REGION\""
         echo "[DRY RUN] gcloud run jobs execute \"$JOB_NAME\" --project \"$PROJECT\" --region \"$REGION\""
     else
-        echo "Checking job:  $JOB_NAME"
-        EXISTING_JOB="$(
-            gcloud run jobs list \
-                --project "$PROJECT" \
-                --region "$REGION" \
-                --filter "name=${JOB_NAME}" \
-                --format "value(name)" \
-                --limit 1
-        )"
+	        echo "Checking job:  $JOB_NAME"
+	        EXISTING_JOB="$(
+	            gcloud run jobs list \
+	                --project "$PROJECT" \
+	                --region "$REGION" \
+	                --filter "metadata.name=${JOB_NAME}" \
+	                --format "value(metadata.name)" \
+	                --limit 1
+	        )"
 
         if [[ "$EXISTING_JOB" == "$JOB_NAME" ]]; then
             echo "Updating job:  $JOB_NAME"
