@@ -13,10 +13,12 @@ FROM python:3.12-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         bcftools \
+        tabix \
         curl \
         apt-transport-https \
         ca-certificates \
         gnupg \
+        git \
         gcc \
         libc6-dev \
         libpq-dev \
@@ -26,13 +28,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
        | tee /usr/share/keyrings/cloud.google.asc > /dev/null \
     && apt-get update && apt-get install -y --no-install-recommends google-cloud-cli \
-    && pip install --no-cache-dir "ga4gh.vrs[extras]==2.2.0" \
-    && apt-get purge -y --auto-remove gcc libc6-dev libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Cache-bust this layer with: --build-arg CACHE_BUST=$(date +%s)
+ARG CACHE_BUST=0
+RUN pip install --no-cache-dir "ga4gh.vrs[extras] @ git+https://github.com/ga4gh/vrs-python.git@kf/perf"
+
+RUN apt-get purge -y --auto-remove git gcc libc6-dev libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=seqrepo-builder /seqrepo /seqrepo
 
 ENV GA4GH_VRS_DATAPROXY_URI="seqrepo+file:///seqrepo"
+
+COPY logging.json /etc/vrs-annotate/logging.json
+ENV VRS_ANNOTATE_LOG_CONFIG="/etc/vrs-annotate/logging.json"
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

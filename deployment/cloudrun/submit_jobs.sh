@@ -63,7 +63,7 @@ if [[ ${#CONTIGS[@]} -eq 0 ]]; then
     CONTIGS=(chr{1..22} chrX chrY)
 fi
 
-SOURCE_LC="${SOURCE,,}"
+SOURCE_LC="$(echo "$SOURCE" | tr '[:upper:]' '[:lower:]')"
 
 if [[ -n "$IMAGE_OVERRIDE" && -n "$TAG" ]]; then
     echo "Error: use either --image or --tag, not both." >&2
@@ -93,7 +93,7 @@ echo ""
 
 # ── Submit jobs ──────────────────────────────────────────────────
 for contig in "${CONTIGS[@]}"; do
-    CONTIG_LC="${contig,,}"
+    CONTIG_LC="$(echo "$contig" | tr '[:upper:]' '[:lower:]')"
     JOB_NAME="vrs-annotate-${SOURCE_LC}-${CONTIG_LC}"
 
     LABELS="app=gnomad-gks,component=vrs-annotate,source=${SOURCE_LC},contig=${CONTIG_LC}"

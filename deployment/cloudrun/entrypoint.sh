@@ -29,10 +29,10 @@ WORKDIR="/tmp/work"
 BASENAME="gnomad.${SOURCE}.v4.1.sites.${CONTIG}"
 
 STRIPPED_VCF="${WORKDIR}/${BASENAME}.stripped.vcf.bgz"
-ANNOTATED_VCF="${WORKDIR}/${BASENAME}.VRS.vcf.bgz"
 
 GCS_STRIPPED="gs://${OUTPUT_BUCKET}/vcf-stripped"
 GCS_VRS="gs://${OUTPUT_BUCKET}/vcf-vrs"
+GCS_ANNOTATED="${GCS_VRS}/${BASENAME}.VRS.vcf.gz"
 
 mkdir -p "$WORKDIR"
 
@@ -45,42 +45,64 @@ echo "  SEQREPO_PATH:  $SEQREPO_PATH"
 echo "  GNOMAD_URL:    $GNOMAD_URL"
 echo "========================================"
 
-# ── Step 1: Download and strip VCF in one pass ──────────────────
+# ── Step 1: Get stripped VCF (download from cache or create) ────
 echo ""
-echo "[Step 1/3] Downloading and stripping VCF to CHROM/POS/REF/ALT..."
+echo "[Step 1/2] Getting stripped VCF..."
 START=$(date +%s)
 
-curl -sSL "$GNOMAD_URL" \
-    | bcftools annotate -x ID,INFO,FILTER -Oz -o "$STRIPPED_VCF"
+# Check for existing stripped VCF in GCS (try new naming, then old naming)
+GCS_STRIPPED_NEW="${GCS_STRIPPED}/${BASENAME}.stripped.vcf.bgz"
+GCS_STRIPPED_OLD="${GCS_STRIPPED}/gnomad_${CONTIG}.vcf.bgz"
 
-ELAPSED=$(( $(date +%s) - START ))
-echo "  Completed in ${ELAPSED}s ($(du -h "$STRIPPED_VCF" | cut -f1))"
+if gcloud storage ls "$GCS_STRIPPED_NEW" &>/dev/null; then
+    echo "  Found cached stripped VCF: $GCS_STRIPPED_NEW"
+    gcloud storage cp "$GCS_STRIPPED_NEW" "$STRIPPED_VCF"
+    ELAPSED=$(( $(date +%s) - START ))
+    echo "  Downloaded in ${ELAPSED}s ($(du -h "$STRIPPED_VCF" | cut -f1))"
+elif gcloud storage ls "$GCS_STRIPPED_OLD" &>/dev/null; then
+    echo "  Found cached stripped VCF (old naming): $GCS_STRIPPED_OLD"
+    gcloud storage cp "$GCS_STRIPPED_OLD" "$STRIPPED_VCF"
+    ELAPSED=$(( $(date +%s) - START ))
+    echo "  Downloaded in ${ELAPSED}s ($(du -h "$STRIPPED_VCF" | cut -f1))"
+else
+    echo "  No cached VCF found, downloading and stripping from gnomAD..."
+    curl -sSL "$GNOMAD_URL" \
+        | bcftools annotate -x ID,INFO,FILTER -Oz -o "$STRIPPED_VCF"
+    ELAPSED=$(( $(date +%s) - START ))
+    echo "  Completed in ${ELAPSED}s ($(du -h "$STRIPPED_VCF" | cut -f1))"
+    UPLOAD_STRIPPED=true
+fi
 
-# ── Step 2: VRS annotation ──────────────────────────────────────
+# ── Count variants for progress estimation ─────────────────────
 echo ""
-echo "[Step 2/3] Running VRS annotation..."
+echo "Counting variants in stripped VCF..."
+VARIANT_COUNT=$(bcftools view -H "$STRIPPED_VCF" | wc -l)
+echo "  Total variants: $VARIANT_COUNT"
+
+# ── Step 2: VRS annotation + upload (streamed to GCS) ──────────
+echo ""
+echo "[Step 2/2] Running VRS annotation (streaming output to GCS)..."
+echo "  Output: $GCS_ANNOTATED"
 START=$(date +%s)
 
+# Only upload stripped VCF if we created it (not if downloaded from cache)
+if [[ "${UPLOAD_STRIPPED:-}" == "true" ]]; then
+    echo "  Uploading stripped VCF..."
+    gcloud storage cp "$STRIPPED_VCF" "${GCS_STRIPPED}/${BASENAME}.stripped.vcf.bgz"
+fi
+
+# Stream: vrs-annotate writes uncompressed VCF to stdout,
+# bgzip compresses to BGZF format, gcloud streams to GCS.
+# This avoids writing the (potentially multi-GB) output to tmpfs.
+SEQREPO_FD_CACHE_MAXSIZE=None \
 vrs-annotate vcf \
     --vrs-attributes \
     --dataproxy-uri "seqrepo+file://${SEQREPO_PATH}" \
-    --vcf-out "$ANNOTATED_VCF" \
-    "$STRIPPED_VCF"
-
-ELAPSED=$(( $(date +%s) - START ))
-echo "  Completed in ${ELAPSED}s ($(du -h "$ANNOTATED_VCF" | cut -f1))"
-
-# ── Step 3: Upload to GCS ───────────────────────────────────────
-echo ""
-echo "[Step 3/3] Uploading results to GCS..."
-START=$(date +%s)
-
-gcloud storage cp "$STRIPPED_VCF" "${GCS_STRIPPED}/${BASENAME}.stripped.vcf.bgz"
-gcloud storage cp "$ANNOTATED_VCF" "${GCS_VRS}/${BASENAME}.VRS.vcf.bgz"
-
-if [[ -f "${ANNOTATED_VCF}.tbi" ]]; then
-    gcloud storage cp "${ANNOTATED_VCF}.tbi" "${GCS_VRS}/${BASENAME}.VRS.vcf.bgz.tbi"
-fi
+    --vcf-out - \
+    --log-every 100000 \
+    "$STRIPPED_VCF" \
+  | bgzip -c \
+  | gcloud storage cp - "$GCS_ANNOTATED"
 
 ELAPSED=$(( $(date +%s) - START ))
 echo "  Completed in ${ELAPSED}s"
@@ -88,6 +110,10 @@ echo "  Completed in ${ELAPSED}s"
 echo ""
 echo "========================================"
 echo "Job complete."
-echo "  Stripped:  ${GCS_STRIPPED}/${BASENAME}.stripped.vcf.bgz"
-echo "  Annotated: ${GCS_VRS}/${BASENAME}.VRS.vcf.bgz"
+echo "  Annotated: $GCS_ANNOTATED"
+if [[ "${UPLOAD_STRIPPED:-}" == "true" ]]; then
+    echo "  Stripped:  ${GCS_STRIPPED}/${BASENAME}.stripped.vcf.bgz (uploaded)"
+else
+    echo "  Stripped:  (used cached version)"
+fi
 echo "========================================"
