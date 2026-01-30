@@ -98,6 +98,7 @@ SEQREPO_FD_CACHE_MAXSIZE=None \
 vrs-annotate vcf \
     --vrs-attributes \
     --dataproxy-uri "seqrepo+file://${SEQREPO_PATH}" \
+    --silent \
     --vcf-out - \
     --log-every 100000 \
     "$STRIPPED_VCF" \
