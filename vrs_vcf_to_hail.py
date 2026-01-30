@@ -22,12 +22,8 @@ hl.init(
     spark_conf={"spark.local.dir": str(spark_local_dir)},
 )
 
-# vcf_gcs_urls = [
-#     "gs://kferrite-sandbox-storage/vcf-vrs/gnomad.genomes.v4.1.sites.chrY.VRS.vcf.bgz",
-# ]
-
 contigs = [str(i) for i in range(1, 22)] + ["X", "Y"]
-# contigs = ["Y"]
+# contigs = ["22"]
 vcf_gcs_urls = [
     f"gs://kferrite-sandbox-storage/vcf-vrs/gnomad.genomes.v4.1.sites.chr{contig}.VRS.vcf.bgz"
     for contig in contigs
