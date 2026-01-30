@@ -1,6 +1,5 @@
 import shutil
-import subprocess
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 import hail as hl
 
@@ -11,9 +10,14 @@ hail_tmp_dir.mkdir(parents=True, exist_ok=True)
 
 hl.init(
     tmp_dir=str(hail_tmp_dir),
-    spark_conf={"spark.local.dir": str(spark_local_dir)},
+    spark_conf={
+        "spark.local.dir": str(spark_local_dir),
+        # Default is 1g. Seeing massive spillover to disk.
+        # Running on a 16GiB RAM machine, so allocate 6g to driver and executor each.
+        "spark.driver.memory": "6g",
+        "spark.executor.memory": "6g",
+    },
 )
-# hl.init()
 
 
 contigs = [str(i) for i in range(1, 23)] + ["X", "Y"]
@@ -54,7 +58,10 @@ print(f"Count of unioned table: {ht_union.count()}")
 
 # Repartition unioned table with shuffle to redistribute
 # (current gnomad 4.1 genomes uses ~8k partitions)
-ht_union = ht_union.repartition(10000, shuffle=True)
+# EDIT: turning off shuffle since input tables are 1000 each
+# and so this is downsizing the partitions from 24000 to 10000
+# which does not benefit from shuffling as much.
+ht_union = ht_union.repartition(10000, shuffle=False)
 
 # Delete this dir if it exists
 output_path = Path("./gnomad.genomes.v4.1.sites.all_contigs.VRS.ht")
