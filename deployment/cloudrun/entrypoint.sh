@@ -25,6 +25,8 @@ fi
 
 # ── Derived variables ────────────────────────────────────────────
 GNOMAD_URL="https://storage.googleapis.com/gcp-public-data--gnomad/release/4.1/vcf/${SOURCE}/gnomad.${SOURCE}.v4.1.sites.${CONTIG}.vcf.bgz"
+# e.g. exomes:
+# GNOMAD_URL="https://storage.googleapis.com/gcp-public-data--gnomad/release/4.1/vcf/exomes/gnomad.exomes.v4.1.sites.chr1.vcf.bgz"
 WORKDIR="/tmp/work"
 BASENAME="gnomad.${SOURCE}.v4.1.sites.${CONTIG}"
 
@@ -32,7 +34,7 @@ STRIPPED_VCF="${WORKDIR}/${BASENAME}.stripped.vcf.bgz"
 
 GCS_STRIPPED="gs://${OUTPUT_BUCKET}/vcf-stripped"
 GCS_VRS="gs://${OUTPUT_BUCKET}/vcf-vrs"
-GCS_ANNOTATED="${GCS_VRS}/${BASENAME}.VRS.vcf.gz"
+GCS_ANNOTATED="${GCS_VRS}/${BASENAME}.VRS.vcf.bgz"
 
 mkdir -p "$WORKDIR"
 
@@ -103,7 +105,7 @@ vrs-annotate vcf \
     --log-every 100000 \
     "$STRIPPED_VCF" \
   | bgzip -c \
-  | gcloud storage cp - "$GCS_ANNOTATED"
+  | gcloud storage cp --content-type=application/octet-stream - "$GCS_ANNOTATED"
 
 ELAPSED=$(( $(date +%s) - START ))
 echo "  Completed in ${ELAPSED}s"
