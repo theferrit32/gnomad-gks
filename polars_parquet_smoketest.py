@@ -13,16 +13,19 @@ This script:
 - Scans the dataset lazily with Polars (no full materialization).
 - Filters to a contig (default: chrY).
 - Runs a few point and range position queries.
-- Computes some aggregate stats (row count, min/max position, etc.).
+- Avoids whole-contig aggregates (only queries with position predicates).
 - Prints timing for each query so you can sanity-check pruning/perf.
 
 Requirements:
   pip install polars
+  # For gs:// datasets:
+  pip install fsspec gcsfs
 
 Usage:
   python3 polars_parquet_smoketest.py --dataset ./gnomad.genomes.v4.1.sites.VRS.parquet --contig chrY
   python3 polars_parquet_smoketest.py --dataset ./gnomad.genomes.v4.1.sites.VRS.parquet --contig chrY --n-point-queries 10
   python3 polars_parquet_smoketest.py --dataset ./gnomad.genomes.v4.1.sites.VRS.parquet --contig chr1 --n-range-queries 8 --range-width 500000
+  python3 polars_parquet_smoketest.py --dataset gs://my-bucket/path/to/ds --contig chrY
 
 How to use the dataset from DuckDB / Polars:
   DuckDB:
@@ -43,6 +46,7 @@ import random
 import statistics
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 import polars as pl
 
@@ -68,26 +72,83 @@ def _time_it(label: str, fn):
 
 
 def _collect(lf: pl.LazyFrame, *, streaming: bool) -> pl.DataFrame:
-    # Older Polars versions may not support `streaming=...`; fall back.
+    # Polars deprecated `streaming=...` in favor of `engine=...` (e.g. engine="streaming").
+    # Keep compatibility with older versions by trying engine first, then falling back.
     try:
-        return lf.collect(streaming=streaming)
+        return lf.collect(engine="streaming" if streaming else "auto")
     except TypeError:
-        return lf.collect()
+        try:
+            return lf.collect(streaming=streaming)
+        except TypeError:
+            return lf.collect()
 
 
-def _parquet_file_stats(dataset_root: Path, contig: str) -> None:
-    contig_dir = dataset_root / f"contig={contig}"
-    if not contig_dir.exists():
-        # If the user passed a contig dir directly, accept that too.
-        contig_dir = dataset_root
-    files = [p for p in contig_dir.rglob("*.parquet") if p.is_file()]
-    if not files:
+def _dataset_scheme(dataset: str) -> str:
+    scheme = urlparse(dataset).scheme
+    if scheme in ("", "file"):
+        return "local"
+    if scheme == "gs":
+        return "gs"
+    raise SystemExit(f"Unsupported dataset URL scheme: {scheme!r}")
+
+
+def _contig_dir(dataset: str, contig: str | None) -> tuple[str, str]:
+    dataset = dataset.rstrip("/")
+    last = dataset.split("/")[-1]
+
+    if last.startswith("contig="):
+        dataset_contig = last.removeprefix("contig=")
+        if contig is None:
+            contig = dataset_contig
+        elif contig != dataset_contig:
+            raise SystemExit(
+                f"--contig {contig!r} does not match dataset path contig {dataset_contig!r}"
+            )
+        return dataset, contig
+
+    if contig is None:
+        contig = "chrY"
+    return f"{dataset}/contig={contig}", contig
+
+
+def _list_parquet_files(contig_dir: str, *, scheme: str) -> list[str]:
+    if scheme == "local":
+        contig_path = Path(contig_dir)
+        if not contig_path.exists():
+            raise SystemExit(f"Path does not exist: {contig_path}")
+        return sorted(str(p) for p in contig_path.rglob("*.parquet") if p.is_file())
+
+    if scheme == "gs":
+        try:
+            import fsspec  # type: ignore[import-not-found]
+        except ImportError as e:
+            raise SystemExit(
+                "gs:// support requires fsspec + gcsfs: pip install fsspec gcsfs"
+            ) from e
+
+        try:
+            fs, path = fsspec.core.url_to_fs(contig_dir)
+        except (ImportError, ModuleNotFoundError) as e:
+            raise SystemExit(
+                "gs:// support requires fsspec + gcsfs: pip install fsspec gcsfs"
+            ) from e
+
+        files = fs.find(path)
+        return sorted(
+            fs.unstrip_protocol(p) for p in files if str(p).endswith(".parquet")
+        )
+
+    raise AssertionError(f"Unhandled scheme: {scheme}")
+
+
+def _local_parquet_file_stats(*, contig_dir: str, parquet_files: list[str]) -> None:
+    if not parquet_files:
         print(f"No parquet files found under: {contig_dir}")
         return
 
-    sizes = [p.stat().st_size for p in files]
+    sizes = [Path(p).stat().st_size for p in parquet_files]
     total = sum(sizes)
-    print(f"Parquet files under {contig_dir}: {len(files)}")
+    print(f"Parquet files under {contig_dir}: {len(parquet_files)}")
     print(
         "File sizes:",
         f"total={_human_bytes(total)}",
@@ -98,16 +159,8 @@ def _parquet_file_stats(dataset_root: Path, contig: str) -> None:
     )
 
 
-def _list_contig_parquet_files(dataset_root: Path, contig: str) -> list[Path]:
-    contig_dir = dataset_root / f"contig={contig}"
-    if not contig_dir.exists():
-        # If the user passed a contig dir directly, accept that too.
-        contig_dir = dataset_root
-    return sorted([p for p in contig_dir.rglob("*.parquet") if p.is_file()])
-
-
 def _sample_existing_positions_from_files(
-    parquet_files: list[Path],
+    parquet_files: list[str],
     *,
     n_files: int,
     n_rows_per_file: int,
@@ -152,7 +205,9 @@ def main() -> int:
         help="Parquet dataset root (directory containing contig=... subdirs).",
     )
     parser.add_argument(
-        "--contig", default="chrY", help="Contig to query (default: chrY)."
+        "--contig",
+        default=None,
+        help="Contig to query (e.g. chrY). Defaults to chrY unless the dataset path is already contig=...",
     )
     parser.add_argument(
         "--seed",
@@ -197,90 +252,42 @@ def main() -> int:
         help="Max rows to print for example queries (default: 5).",
     )
     parser.add_argument(
-        "--full",
-        action="store_true",
-        help="Run more expensive stats (e.g. n_unique(position)).",
-    )
-    parser.add_argument(
         "--no-streaming",
         action="store_true",
         help="Disable Polars streaming collects (useful if your Polars build doesn't support it).",
     )
+    parser.add_argument(
+        "--local-file-stats",
+        action="store_true",
+        help="Print local-only parquet file size stats (ignored for gs://).",
+    )
     args = parser.parse_args()
 
-    dataset_root = Path(args.dataset)
-    _parquet_file_stats(dataset_root, args.contig)
-    parquet_files = _list_contig_parquet_files(dataset_root, args.contig)
+    dataset = args.dataset
+    parsed = urlparse(dataset)
+    scheme = _dataset_scheme(dataset)
+    if parsed.scheme == "file":
+        dataset = parsed.path
 
-    scan_path = str(dataset_root / "**" / "*.parquet")
-    lf = pl.scan_parquet(scan_path, hive_partitioning=True)
+    contig_dir, contig = _contig_dir(dataset, args.contig)
+    parquet_files = _list_parquet_files(contig_dir, scheme=scheme)
+    if not parquet_files:
+        raise SystemExit(f"No parquet files found under: {contig_dir}")
+
+    if args.local_file_stats:
+        if scheme == "local":
+            _local_parquet_file_stats(contig_dir=contig_dir, parquet_files=parquet_files)
+        else:
+            print("--local-file-stats is only supported for local filesystem paths; skipping.")
+
+    lf = pl.scan_parquet(parquet_files, hive_partitioning=True)
 
     schema = lf.collect_schema()
-    if "contig" not in schema:
-        raise SystemExit(
-            "No 'contig' column found. Expected Hive partitioning (contig=chrY directories)."
-        )
     if "position" not in schema:
         raise SystemExit("No 'position' column found in Parquet dataset.")
 
-    lf_contig = lf.filter(pl.col("contig") == args.contig)
+    lf_contig = lf.filter(pl.col("contig") == contig) if "contig" in schema else lf
     streaming = not args.no_streaming
-
-    # Basic contig stats (should be safe even for large contigs).
-    basic_stats = _time_it(
-        f"{args.contig}: basic stats",
-        lambda: _collect(
-            lf_contig.select(
-                pl.len().alias("n_rows"),
-                pl.col("position").min().alias("pos_min"),
-                pl.col("position").max().alias("pos_max"),
-            ),
-            streaming=streaming,
-        ),
-    )
-    print(basic_stats)
-
-    n_rows = int(basic_stats["n_rows"][0])
-    pos_min = basic_stats["pos_min"][0]
-    pos_max = basic_stats["pos_max"][0]
-    if n_rows == 0 or pos_min is None or pos_max is None:
-        raise SystemExit(f"No rows found for contig {args.contig}")
-    pos_min = int(pos_min)
-    pos_max = int(pos_max)
-    print(f"{args.contig}: n_rows={n_rows} pos_min={pos_min} pos_max={pos_max}")
-
-    # Quick list-length stats (useful sanity checks for multi-allelic / structural cases).
-    len_exprs: list[pl.Expr] = []
-    if "alleles" in schema:
-        len_exprs.append(pl.col("alleles").list.len().alias("alleles_n"))
-    if "VRS_Allele_IDs" in schema:
-        len_exprs.append(pl.col("VRS_Allele_IDs").list.len().alias("vrs_ids_n"))
-
-    if len_exprs:
-        len_stats = _time_it(
-            f"{args.contig}: list-length stats",
-            lambda: _collect(
-                lf_contig.select(
-                    pl.min_horizontal(*len_exprs).alias("min_list_len"),
-                    pl.max_horizontal(*len_exprs).alias("max_list_len"),
-                ),
-                streaming=streaming,
-            ),
-        )
-        print(len_stats)
-
-    if args.full:
-        # Potentially expensive; may require a full pass.
-        full_stats = _time_it(
-            f"{args.contig}: full stats (n_unique(position))",
-            lambda: _collect(
-                lf_contig.select(
-                    pl.col("position").n_unique().alias("n_unique_positions")
-                ),
-                streaming=False,
-            ),
-        )
-        print(full_stats)
 
     # Choose a random assortment of existing positions (guaranteed to exist) without manual input.
     file_sample_positions = _sample_existing_positions_from_files(
@@ -290,34 +297,25 @@ def main() -> int:
         seed=args.seed,
     )
 
-    # Always include min/max positions (guaranteed to exist by definition).
-    candidate_positions = {pos_min, pos_max}
-    candidate_positions.update(
-        p for p in file_sample_positions if pos_min <= p <= pos_max
-    )
-
-    if len(candidate_positions) < max(3, args.n_point_queries, args.n_range_queries):
-        # Fallback: read a small head slice from the contig scan (may bias toward low positions).
-        sample_df = _time_it(
-            f"{args.contig}: fallback sample positions (head)",
-            lambda: _collect(
-                lf_contig.select("position").head(2000), streaming=streaming
-            ),
-        )
-        candidate_positions.update(
-            int(x) for x in sample_df.get_column("position").to_list() if x is not None
-        )
-
-    candidate_positions_list = sorted(candidate_positions)
+    candidate_positions_list = sorted({int(p) for p in file_sample_positions})
     if not candidate_positions_list:
-        raise SystemExit(f"No positions found for contig {args.contig}")
+        raise SystemExit(
+            f"No positions sampled for contig {contig}. Try increasing --sample-files and/or --rows-per-file-sample."
+        )
+
+    sampled_min = candidate_positions_list[0]
+    sampled_max = candidate_positions_list[-1]
+    print(
+        f"{contig}: sampled positions={len(candidate_positions_list)} "
+        f"sampled_min={sampled_min} sampled_max={sampled_max}"
+    )
 
     n_point_queries = max(0, int(args.n_point_queries))
     if n_point_queries > 0:
         rng = random.Random(args.seed)
-        point_positions: list[int] = [pos_min]
-        if pos_max != pos_min:
-            point_positions.append(pos_max)
+        point_positions: list[int] = [sampled_min]
+        if sampled_max != sampled_min:
+            point_positions.append(sampled_max)
         remaining = [p for p in candidate_positions_list if p not in point_positions]
         rng.shuffle(remaining)
         point_positions.extend(
@@ -327,14 +325,12 @@ def main() -> int:
     else:
         point_positions = []
 
-    print(
-        f"{args.contig}: point query positions ({len(point_positions)}): {point_positions}"
-    )
+    print(f"{contig}: point query positions ({len(point_positions)}): {point_positions}")
 
     # Point queries (positions guaranteed to exist).
     for pos in point_positions:
         count_df = _time_it(
-            f"{args.contig}: point count position={pos}",
+            f"{contig}: point count position={pos}",
             lambda pos=pos: _collect(
                 lf_contig.filter(pl.col("position") == pos).select(
                     pl.len().alias("n_rows")
@@ -351,7 +347,7 @@ def main() -> int:
         ]
         if example_cols:
             examples = _time_it(
-                f"{args.contig}: examples position={pos}",
+                f"{contig}: examples position={pos}",
                 lambda pos=pos: _collect(
                     lf_contig.filter(pl.col("position") == pos)
                     .select(example_cols)
@@ -373,14 +369,14 @@ def main() -> int:
         ]
         range_centers = [candidate_positions_list[i] for i in idxs]
 
-        print(f"{args.contig}: range queries n={n_range_queries} width={range_width}")
+        print(f"{contig}: range queries n={n_range_queries} width={range_width}")
         for center in range_centers:
-            start = max(pos_min, center - range_width // 2)
-            end = min(pos_max, start + range_width - 1)
-            start = max(pos_min, min(start, end))
+            start = max(sampled_min, center - range_width // 2)
+            end = min(sampled_max, start + range_width - 1)
+            start = max(sampled_min, min(start, end))
 
             range_count = _time_it(
-                f"{args.contig}: range count {start}-{end}",
+                f"{contig}: range count {start}-{end}",
                 lambda start=start, end=end: _collect(
                     lf_contig.filter(pl.col("position").is_between(start, end)).select(
                         pl.len().alias("n_rows")
@@ -397,7 +393,7 @@ def main() -> int:
             ]
             if example_cols and args.limit > 0:
                 examples = _time_it(
-                    f"{args.contig}: examples range {start}-{end}",
+                    f"{contig}: examples range {start}-{end}",
                     lambda start=start, end=end: _collect(
                         lf_contig.filter(pl.col("position").is_between(start, end))
                         .select(example_cols)

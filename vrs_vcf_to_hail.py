@@ -7,8 +7,9 @@ Spark will try to spill memory to /tmp which may be too small.
 
 """
 
+import shutil
 import subprocess
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 
 import hail as hl
 
@@ -19,57 +20,100 @@ hail_tmp_dir.mkdir(parents=True, exist_ok=True)
 
 hl.init(
     tmp_dir=str(hail_tmp_dir),
-    spark_conf={"spark.local.dir": str(spark_local_dir)},
+    spark_conf={
+        "spark.local.dir": str(spark_local_dir),
+        # Default is 1g. Seeing massive spillover to disk.
+        # Running on 16GiB RAM vm, so allocate 6g to driver and executor each.
+        "spark.driver.memory": "6g",
+        "spark.executor.memory": "6g",
+    },
 )
 
-contigs = [str(i) for i in range(1, 22)] + ["X", "Y"]
-# contigs = ["22"]
-vcf_gcs_urls = [
-    f"gs://kferrite-sandbox-storage/vcf-vrs/gnomad.genomes.v4.1.sites.chr{contig}.VRS.vcf.bgz"
-    for contig in contigs
-]
+bucket = "kferrite-sandbox-storage"
+source = "exomes"  # "genomes" or "exomes"
+vcf_prefix = "vcf-vrs-fixed"
+ht_prefix = "ht-vrs"
+
+output_ht_url = f"gs://{bucket}/{ht_prefix}/gnomad.{source}.v4.1.sites.VRS.ht/"
+# vcf_url_templ = (
+#     f"gs://{bucket}/{vcf_prefix}/gnomad.{source}.v4.1.sites.chr{{}}.VRS.vcf.bgz"
+# )
+vcf_url_templ = f"./{vcf_prefix}/gnomad.{source}.v4.1.sites.chr{{}}.VRS.vcf.bgz"
+contigs = [str(i) for i in range(1, 23)] + ["X", "Y"]
+
+vcf_gcs_urls = [vcf_url_templ.format(contig) for contig in contigs]
 
 
-def import_vcf_to_hail(vcf_gcs_url: str) -> hl.MatrixTable:
-    return hl.import_vcf(
+def restructure_table(ht: hl.MatrixTable) -> hl.Table:
+    """
+    Convert MatrixTable to Table with only the locus, alleles, and info field.
+    Drop the .info.VRS_Error field since it's empty for gnomad since there
+    are no invalid values such as positions or sequences or refs or expressions.
+    """
+    ht_out = ht.rows()
+    ht_out = ht_out.key_by("locus", "alleles")
+    ht_out = ht_out.select("info")
+    # Drop .info.VRS_Error since they're all empty for the gnomad use case
+    if "VRS_Error" in ht_out.info.dtype.fields:
+        ht_out = ht_out.annotate(info=ht_out.info.drop("VRS_Error"))
+    return ht_out
+
+
+def import_vcf_to_hail(vcf_gcs_url: str) -> hl.Table:
+    matrix_table = hl.import_vcf(
         vcf_gcs_url,
         reference_genome="GRCh38",
         force_bgz=True,
         array_elements_required=False,
     )
+    ht = restructure_table(matrix_table)
+    return ht
 
 
+union_table: hl.Table = None
+
+# Import and restructure
 for vcf_gcs_url in vcf_gcs_urls:
     print("Processing VCF GCS URL:", vcf_gcs_url)
     df = import_vcf_to_hail(vcf_gcs_url)
-    df = df.repartition(1000)
-    df = df.key_rows_by(locus=df.locus, alleles=df.alleles)
-    # Export the Hail Table to a GCS path directly (blows up with OOM even for chrY)
-    # output_path = "gs://kferrite-sandbox-storage/ht-vrs/gnomad.genomes.v4.1.sites.chrY.VRS.ht"
-    # df.write(output_path, overwrite=True)
+    # df = df.repartition(10)
 
-    # For whatever reason, writing it locally does not blow up with OOM
-    ht_local_path = PurePosixPath(vcf_gcs_url).name.removesuffix(".vcf.bgz") + ".ht"
-    print(f"Writing Hail Table locally to path: {ht_local_path}")
-    df.write(f"./{ht_local_path}", overwrite=True)
+    if union_table is None:
+        union_table = df
+    else:
+        # Assert no overlap
+        # assert union_table.join(df, how="inner").count() == 0
+        print("Unioning in table from URL:", vcf_gcs_url)
+        union_table = union_table.union(df)
 
-    # Read back from local path
-    df_ht = hl.read_matrix_table(f"./{ht_local_path}")
+# Repartition unioned table with shuffle to redistribute
+# (current gnomad 4.1 genomes uses ~8k partitions)
+union_table = union_table.repartition(10000, shuffle=True)
 
-    ht_gcs_path = vcf_gcs_url.replace(".vcf.bgz", ".ht/").replace("vcf-vrs", "ht-vrs")
-    print(f"Writing persisted Hail Table to GCS path: {ht_gcs_path}")
-    # Use gcloud CLI to copy local ht directory to GCS url (be careful with slashes for rsync)
-    # Wipe out any existing files at that prefix with --delete-unmatched-destination-objects (careful!)
-    # rsync local ht directory to GCS path
-    subprocess.run(
-        [
-            "gcloud",
-            "storage",
-            "rsync",
-            "-r",
-            "--delete-unmatched-destination-objects",
-            f"./{ht_local_path}/",
-            ht_gcs_path,
-        ],
-        check=True,
-    )
+# Export table locally
+local_path = f"gnomad.{source}.v4.1.sites.VRS.ht"
+print("Persisting hail table locally to path:", local_path)
+if Path(local_path).exists():
+    shutil.rmtree(local_path)
+union_table.write(local_path, overwrite=True)
+
+# Read back from persisted local table. Just a sanity check.
+union_table = hl.read_table(local_path)
+print("Count of persisted unioned table:", union_table.count())
+
+# rsync table to GCS
+print("Writing persisted Hail Table to GCS path:", output_ht_url)
+
+# Wipe out any existing files at that prefix with --delete-unmatched-destination-objects (careful!)
+subprocess.run(
+    [
+        "gcloud",
+        "storage",
+        "rsync",
+        "-r",
+        "--delete-unmatched-destination-objects",
+        f"./{local_path}/",
+        output_ht_url,
+    ],
+    check=True,
+)
